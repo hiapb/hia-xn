@@ -103,7 +103,7 @@ EOF
 version: '3.8'
 services:
   app:
-    image: cedar2025/xboard:latest
+    image: ghcr.io/cedar2025/xboard:latest
     container_name: xboard_web
     restart: always
     env_file: .env
@@ -121,7 +121,7 @@ services:
           memory: 2048M
 
   queue:
-    image: cedar2025/xboard:latest
+    image: ghcr.io/cedar2025/xboard:latest
     container_name: xboard_queue
     restart: always
     env_file: .env
@@ -139,7 +139,7 @@ services:
           memory: 1024M
 
   schedule:
-    image: cedar2025/xboard:latest
+    image: ghcr.io/cedar2025/xboard:latest
     container_name: xboard_schedule
     restart: always
     env_file: .env
