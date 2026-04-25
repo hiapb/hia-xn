@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# XBoard 运维控制台
+# XBoard 运维控制台 - MySQL 多容器版
 # ==========================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 DEFAULT_INSTALL_PATH="/opt/xboard"
-COMPOSE_URL="https://raw.githubusercontent.com/cedar2025/Xboard/master/docker-compose.yaml"
 
 CRON_TAG_BEGIN="# XBOARD_BACKUP_BEGIN"
 CRON_TAG_END="# XBOARD_BACKUP_END"
@@ -50,22 +49,11 @@ get_workdir() {
     echo ""
 }
 
-wait_mysql_ready() {
-    local db_pass="$1"
-    local dc_cmd
-    dc_cmd=$(docker_compose_cmd)
-
-    info "正在等待 MySQL 完全就绪..."
-    for i in {1..60}; do
-        if $dc_cmd -f docker-compose.yaml exec -T mysql mysqladmin ping -h localhost -uxboard -p"${db_pass}" >/dev/null 2>&1; then
-            info "MySQL 已就绪。"
-            return 0
-        fi
-        sleep 2
-    done
-
-    err "MySQL 等待超时，请检查容器日志。"
-    return 1
+fix_xboard_image() {
+    if [[ -f docker-compose.yaml ]]; then
+        sed -i 's#ghcr.io/ghcr.io/cedar2025/xboard:latest#ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
+        sed -i 's#image:[[:space:]]*cedar2025/xboard:latest#image: ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
+    fi
 }
 
 get_compose_port() {
@@ -74,11 +62,49 @@ get_compose_port() {
     echo "${port:-7001}"
 }
 
-fix_xboard_image() {
-    if [[ -f docker-compose.yaml ]]; then
-        sed -i 's#ghcr.io/ghcr.io/cedar2025/xboard:latest#ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
-        sed -i 's#image:[[:space:]]*cedar2025/xboard:latest#image: ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
-    fi
+wait_mysql_ready() {
+    local dc_cmd
+    dc_cmd=$(docker_compose_cmd)
+
+    info "正在等待 MySQL 容器就绪..."
+    for i in {1..60}; do
+        if $dc_cmd -f docker-compose.yaml exec -T mysql mysqladmin ping -h localhost >/dev/null 2>&1; then
+            info "MySQL 容器已就绪。"
+            return 0
+        fi
+        sleep 2
+    done
+
+    err "MySQL 容器等待超时，请检查 mysql 日志。"
+    return 1
+}
+
+wait_app_mysql_ready() {
+    local dc_cmd
+    dc_cmd=$(docker_compose_cmd)
+
+    info "正在等待 App 容器连接 MySQL..."
+    for i in {1..60}; do
+        if $dc_cmd -f docker-compose.yaml exec -T app php -r '
+            $host=getenv("DB_HOST");
+            $db=getenv("DB_DATABASE");
+            $user=getenv("DB_USERNAME");
+            $pass=getenv("DB_PASSWORD");
+            try {
+                new PDO("mysql:host=".$host.";port=3306;dbname=".$db, $user, $pass);
+                exit(0);
+            } catch (Throwable $e) {
+                exit(1);
+            }
+        ' >/dev/null 2>&1; then
+            info "App 已成功连接 MySQL。"
+            return 0
+        fi
+        sleep 2
+    done
+
+    err "App 连接 MySQL 超时，请检查 app/mysql 容器日志。"
+    return 1
 }
 
 # ---- 1. 一键部署系统 ----
@@ -87,16 +113,16 @@ deploy_xboard() {
     require_cmd docker
     require_cmd curl
     require_cmd openssl
-    
+
     local dc_cmd
     dc_cmd=$(docker_compose_cmd)
 
     read -r -p "请输入安装路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
-    
+
     if [[ -d "$install_path" && -f "$install_path/docker-compose.yaml" ]]; then
         err "该路径已存在部署实例，请先执行 [8] 卸载。"
-        return 
+        return
     fi
 
     mkdir -p "$install_path"
@@ -111,7 +137,7 @@ deploy_xboard() {
     local app_key
     db_password=$(openssl rand -hex 16)
     app_key="base64:$(openssl rand -base64 32)"
-    
+
     cat > .env <<EOF
 APP_NAME=XBoard
 APP_ENV=production
@@ -135,7 +161,7 @@ REDIS_PASSWORD=null
 REDIS_PORT=6379
 EOF
 
-    info "正在拉取核心拓扑文件..."
+    info "正在生成 Docker Compose 文件..."
     cat > docker-compose.yaml <<EOF
 services:
   app:
@@ -209,7 +235,7 @@ services:
       MYSQL_DATABASE: xboard
       MYSQL_USER: xboard
       MYSQL_PASSWORD: ${db_password}
-    command: 
+    command:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
       - --innodb_buffer_pool_size=1G
@@ -219,7 +245,7 @@ services:
     volumes:
       - ./mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "xboard", "-p${db_password}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -229,20 +255,26 @@ EOF
     chmod -R 777 data mysql_data redis_data
 
     info "正在拉起微服务矩阵..."
-    $dc_cmd -f docker-compose.yaml up -d || { err "容器启动失败，请检查 Docker 状态。"; return; }
+    $dc_cmd -f docker-compose.yaml up -d || {
+        err "容器启动失败，请检查 Docker 状态。"
+        return
+    }
 
-    wait_mysql_ready "$db_password" || return
+    wait_mysql_ready || return
+    wait_app_mysql_ready || return
 
+    $dc_cmd -f docker-compose.yaml exec -T app php artisan config:clear || true
+    $dc_cmd -f docker-compose.yaml exec -T app php artisan cache:clear || true
     $dc_cmd -f docker-compose.yaml exec -T app php artisan xboard:install || warn "首次安装脚本执行异常，请手动检查。"
 
     local server_ip
     server_ip=$(get_local_ip)
 
     echo -e "\n=================================================="
-    echo -e "\033[32m部署指令已下发！网关正在启动。\033[0m"
+    echo -e "\033[32m✅ XBoard 部署完成！\033[0m"
     echo -e "请务必在服务器防火墙/安全组中放行 \033[31m${host_port}\033[0m 端口！"
     echo -e "访问地址: \033[36mhttp://${server_ip}:${host_port}\033[0m"
-    echo -e "数据库密码 (系统内部使用): \033[33m${db_password}\033[0m"
+    echo -e "数据库密码: \033[33m${db_password}\033[0m"
     echo -e "==================================================\n"
 }
 
@@ -251,7 +283,7 @@ upgrade_service() {
     local workdir
     workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
-        err "未检测到运行中的网关，请先执行 [1] 一键部署。"
+        err "未检测到运行中的 XBoard，请先执行 [1] 一键部署。"
         return
     fi
 
@@ -261,31 +293,39 @@ upgrade_service() {
     info "正在拉取最新镜像并重建容器..."
     $(docker_compose_cmd) -f docker-compose.yaml pull
     $(docker_compose_cmd) -f docker-compose.yaml up -d
-    
-    $(docker_compose_cmd) -f docker-compose.yaml exec -T app php artisan xboard:update
+
+    wait_app_mysql_ready || return
+
+    $(docker_compose_cmd) -f docker-compose.yaml exec -T app php artisan config:clear || true
+    $(docker_compose_cmd) -f docker-compose.yaml exec -T app php artisan cache:clear || true
+    $(docker_compose_cmd) -f docker-compose.yaml exec -T app php artisan xboard:update || warn "升级命令异常，请手动检查。"
+
     info "升级服务完成！"
 }
 
-# ---- 3/4. 启停控制 ----
+# ---- 3. 停止服务 ----
 pause_service() {
     local workdir
     workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
-        err "未检测到运行中的网关，请先执行 [1] 一键部署。"
+        err "未检测到运行中的 XBoard，请先执行 [1] 一键部署。"
         return
     fi
+
     cd "$workdir" || return
     $(docker_compose_cmd) -f docker-compose.yaml stop || true
     info "服务已停止。"
 }
 
+# ---- 4. 重启服务 ----
 restart_service() {
     local workdir
     workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
-        err "未检测到运行中的网关，请先执行 [1] 一键部署。"
+        err "未检测到运行中的 XBoard，请先执行 [1] 一键部署。"
         return
     fi
+
     cd "$workdir" || return
     fix_xboard_image
     $(docker_compose_cmd) -f docker-compose.yaml restart || true
@@ -300,7 +340,10 @@ do_backup() {
         err "未检测到部署环境，无法执行备份。"
         return
     fi
-    
+
+    cd "$workdir" || return
+    fix_xboard_image
+
     local backup_dir="${workdir}/backups"
     mkdir -p "$backup_dir"
 
@@ -308,14 +351,12 @@ do_backup() {
     local backup_file
     timestamp=$(date +"%Y%m%d_%H%M%S")
     backup_file="${backup_dir}/xboard_backup_${timestamp}.tar.gz"
-    
+
     info "开始执行备份..."
-    cd "$workdir" || return
-    fix_xboard_image
-    
+
     local db_pass
     db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
-    
+
     if ! $(docker_compose_cmd) -f docker-compose.yaml exec -T mysql mysqldump -uxboard -p"${db_pass}" xboard > ./database_dump.sql; then
         err "数据库导出失败，备份终止。"
         rm -f ./database_dump.sql
@@ -329,7 +370,7 @@ do_backup() {
     fi
 
     local target_files="docker-compose.yaml .env database_dump.sql data"
-    
+
     tar -czf "$backup_file" $target_files || {
         err "打包失败，备份终止。"
         rm -f ./database_dump.sql
@@ -337,10 +378,10 @@ do_backup() {
     }
 
     rm -f ./database_dump.sql
-    
+
     cd "$backup_dir" || return
     ls -t xboard_backup_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -r rm -f
-    
+
     info "备份执行完毕。当前可用备份如下："
     for f in $(ls -t xboard_backup_*.tar.gz 2>/dev/null); do
         local abs_path="${backup_dir}/${f}"
@@ -353,18 +394,18 @@ do_backup() {
 # ---- 6. 恢复备份 ----
 restore_backup() {
     info "== 灾备恢复 / 数据迁入引擎 =="
-    
+
     local default_backup=""
     local current_wd
     local search_dir
 
     current_wd=$(get_workdir)
     search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
-    
+
     if [[ -d "$search_dir" ]]; then
         default_backup=$(ls -t "${search_dir}"/xboard_backup_*.tar.gz 2>/dev/null | head -n 1 || true)
     fi
-    
+
     local backup_path=""
     if [[ -n "$default_backup" ]]; then
         echo -e "已智能嗅探到最新备份快照: \033[33m${default_backup}\033[0m"
@@ -373,15 +414,15 @@ restore_backup() {
     else
         read -r -p "请输入备份文件(.tar.gz)路径: " backup_path
     fi
-    
-    if [[ ! -f "$backup_path" ]]; then 
+
+    if [[ ! -f "$backup_path" ]]; then
         err "目标路径下未找到有效的快照文件，请检查。"
         return
     fi
-    
+
     read -r -p "请输入恢复到的目标路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local target_dir=${input_path:-$DEFAULT_INSTALL_PATH}
-    
+
     if [[ -d "$target_dir" && -f "$target_dir/docker-compose.yaml" ]]; then
         warn "目标目录已存在实例，恢复将覆盖现有数据！"
         read -r -p "是否强制覆盖继续？(y/N): " force_override
@@ -390,7 +431,8 @@ restore_backup() {
             return
         fi
 
-        cd "$target_dir" && $(docker_compose_cmd) -f docker-compose.yaml down || true
+        cd "$target_dir" || return
+        $(docker_compose_cmd) -f docker-compose.yaml down || true
 
         rm -rf "$target_dir/data" \
                "$target_dir/mysql_data" \
@@ -400,36 +442,44 @@ restore_backup() {
                "$target_dir/.env" \
                "$target_dir/database_dump.sql"
     fi
-    
+
     mkdir -p "$target_dir"
-    tar -xzf "$backup_path" -C "$target_dir" || { err "解压失败，备份包可能损坏。"; return; }
-    
+    tar -xzf "$backup_path" -C "$target_dir" || {
+        err "解压失败，备份包可能损坏。"
+        return
+    }
+
     echo "$target_dir" > "/etc/xboard_env"
     cd "$target_dir" || return
-    
-    chmod -R 777 data mysql_data postgres_data redis_data 2>/dev/null || true
+
+    if [[ -d "postgres_data" && ! -d "mysql_data" ]]; then
+        warn "检测到旧版 postgres_data，自动改名为 mysql_data。"
+        mv postgres_data mysql_data
+    fi
+
+    mkdir -p data mysql_data redis_data
+    chmod -R 777 data mysql_data redis_data 2>/dev/null || true
 
     if [[ ! -f "./docker-compose.yaml" || ! -f "./.env" ]]; then
         err "备份包缺少 docker-compose.yaml 或 .env，恢复终止。"
         return
     fi
 
-    if [[ -d "postgres_data" && ! -d "mysql_data" ]]; then
-        warn "检测到旧版 postgres_data 数据目录，自动兼容为 mysql_data。"
-        mv postgres_data mysql_data
-    fi
-
     fix_xboard_image
-    
-    $(docker_compose_cmd) -f docker-compose.yaml up -d || { err "恢复启动失败。"; return; }
-    
-    local db_pass
-    db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
 
-    wait_mysql_ready "$db_pass" || return
+    $(docker_compose_cmd) -f docker-compose.yaml up -d || {
+        err "恢复启动失败。"
+        return
+    }
+
+    wait_mysql_ready || return
+    wait_app_mysql_ready || return
 
     if [[ -f "./database_dump.sql" ]]; then
-        info "正在导入备份 SQL..."
+        info "正在导入备份数据库..."
+
+        local db_pass
+        db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
 
         if ! $(docker_compose_cmd) -f docker-compose.yaml exec -T mysql mysql -uxboard -p"${db_pass}" xboard < ./database_dump.sql; then
             err "数据库导入失败，请检查 database_dump.sql。"
@@ -441,14 +491,14 @@ restore_backup() {
     else
         warn "备份包中没有 database_dump.sql，仅恢复了文件和容器配置。"
     fi
-    
+
     local server_ip
     local restore_port
     server_ip=$(get_local_ip)
     restore_port=$(get_compose_port)
-    
+
     echo -e "\n=================================================="
-    echo -e "\033[32m✅ XBoard站点 恢复完成！\033[0m"
+    echo -e "\033[32m✅ XBoard 站点恢复完成！\033[0m"
     echo -e "访问地址: \033[36mhttp://${server_ip}:${restore_port}\033[0m"
     echo -e "==================================================\n"
 }
@@ -474,7 +524,7 @@ setup_auto_backup() {
     local hour=""
     local minute=""
     local tmp_cron=""
-    
+
     local cron_script="${workdir}/cron_backup.sh"
 
     existing_cron="$(crontab -l 2>/dev/null | sed -n "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/p" | grep -v "^#" || true)"
@@ -492,13 +542,13 @@ setup_auto_backup() {
         echo -e "当前未检测到定时备份任务。"
     fi
 
-    echo " 1) 按固定分钟步进备份（推荐：1/2/3/4/5/6/10/12/15/20/30）"
+    echo " 1) 按固定分钟步进备份（推荐：10/15/20/30/60）"
     echo " 2) 按每日固定时间点备份（例如：每天 04:30）"
     echo " 3) 删除当前的定时备份任务"
     read -r -p "请选择策略 [1/2/3]: " cron_type
 
     if [[ "$cron_type" == "1" ]]; then
-        read -r -p "请输入间隔分钟数 [仅支持 1,2,3,4,5,6,10,12,15,20,30]: " min_interval
+        read -r -p "请输入间隔分钟数 [推荐 10/15/20/30/60]: " min_interval
         if [[ ! "$min_interval" =~ ^[0-9]+$ ]]; then
             err "输入无效，必须是整数。"
             return
@@ -528,15 +578,17 @@ setup_auto_backup() {
         return
     fi
 
-    info "正在为您生成定时备份程序..."
+    info "正在生成定时备份程序..."
     cat > "$cron_script" << EOF
 #!/usr/bin/env bash
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
+
 WORKDIR="${workdir}"
 cd "\$WORKDIR" || exit 1
 
 BACKUP_DIR="\${WORKDIR}/backups"
 mkdir -p "\$BACKUP_DIR"
+
 TIMESTAMP=\$(date +"%Y%m%d_%H%M%S")
 BACKUP_FILE="\${BACKUP_DIR}/xboard_backup_\${TIMESTAMP}.tar.gz"
 
@@ -545,7 +597,7 @@ if command -v docker-compose >/dev/null 2>&1; then
 elif docker compose version >/dev/null 2>&1; then
     DC_CMD="docker compose"
 else
-    echo "[\$(date)] [FATAL] 未检测到 Docker Compose 引擎，时钟中止。" >> ${BACKUP_LOG}
+    echo "[\$(date)] [FATAL] 未检测到 Docker Compose，备份终止。" >> ${BACKUP_LOG}
     exit 1
 fi
 
@@ -579,15 +631,18 @@ else
     exit 1
 fi
 EOF
+
     chmod +x "$cron_script"
 
     tmp_cron="$(mktemp)"
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
+
     cat >> "$tmp_cron" <<EOF
 ${CRON_TAG_BEGIN}
 ${cron_spec} bash ${cron_script} >> ${BACKUP_LOG} 2>&1
 ${CRON_TAG_END}
 EOF
+
     crontab "$tmp_cron" 2>/dev/null || true
     rm -f "$tmp_cron"
 
@@ -604,28 +659,28 @@ uninstall_service() {
         err "未检测到部署环境，无需卸载。"
         return
     fi
-    
-    echo -e "\033[31m⚠️ 警告：这将彻底摧毁所有容器及业务数据！\033[0m"
+
+    echo -e "\033[31m⚠️ 警告：这将彻底删除 XBoard 容器及本地业务数据！\033[0m"
     read -r -p "确认完全卸载？(y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         info "操作已取消。"
         return
     fi
-    
+
     cd "$workdir" || return
     $(docker_compose_cmd) -f docker-compose.yaml down -v || true
-    
+
     cd /
     rm -rf "$workdir" || true
     rm -f "/etc/xboard_env" || true
-    
+
     local tmp_cron
     tmp_cron=$(mktemp)
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     crontab "$tmp_cron" 2>/dev/null || true
     rm -f "$tmp_cron" || true
-    
-    info "容器及业务数据已被安全抹除。"
+
+    info "XBoard 容器及本地业务数据已删除。"
 }
 
 install_ftp(){
@@ -658,7 +713,7 @@ main_menu() {
     echo "  9) 📂 FTP/SFTP 备份工具"
     echo "  0) 退出脚本"
     echo "==================================================="
-    
+
     read -r -p "请输入操作序号 [0-9]: " choice
     case "$choice" in
         1) deploy_xboard ;;
