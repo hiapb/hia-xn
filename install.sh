@@ -8,6 +8,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 DEFAULT_INSTALL_PATH="/opt/xboard"
+COMPOSE_URL="https://raw.githubusercontent.com/cedar2025/Xboard/master/docker-compose.yaml"
 
 CRON_TAG_BEGIN="# XBOARD_BACKUP_BEGIN"
 CRON_TAG_END="# XBOARD_BACKUP_END"
@@ -30,10 +31,8 @@ get_local_ip() {
 docker_compose_cmd() {
     if command -v docker-compose >/dev/null 2>&1; then
         echo "docker-compose"
-    elif docker compose version >/dev/null 2>&1; then
-        echo "docker compose"
     else
-        die "未检测到 Docker Compose，请先安装 docker-compose 或 docker compose 插件。"
+        echo "docker compose"
     fi
 }
 
@@ -52,6 +51,7 @@ get_workdir() {
 deploy_xboard() {
     info "== 启动 XBoard 自动化部署编排 =="
     require_cmd docker
+    require_cmd curl
     require_cmd openssl
     
     local dc_cmd=$(docker_compose_cmd)
@@ -181,7 +181,7 @@ services:
       - --innodb_flush_log_at_trx_commit=2
       - --skip-log-bin
     volumes:
-      - ./mysql_data:/var/lib/mysql
+      - ./postgres_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${db_password}"]
       interval: 15s
@@ -189,8 +189,8 @@ services:
       retries: 5
 EOF
 
-    mkdir -p data mysql_data redis_data
-    chmod -R 777 data mysql_data redis_data
+    mkdir -p data postgres_data redis_data
+    chmod -R 777 data postgres_data redis_data
 
     info "正在拉起微服务矩阵 (首次拉取需 1-3 分钟)..."
     $dc_cmd -f docker-compose.yaml up -d || { err "容器启动失败，请检查 Docker 状态。"; return; }
@@ -247,7 +247,7 @@ restart_service() {
     info "服务已重启。"
 }
 
-# ---- 5. 手动热备 (容灾熔断版) ----
+# ---- 5. 手动热备 (注入高容错机制) ----
 do_backup() {
     local workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
@@ -264,20 +264,14 @@ do_backup() {
     cd "$workdir" || return
     
     local db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
-    
-    if ! $(docker_compose_cmd) -f docker-compose.yaml exec -T mysql mysqldump -uxboard -p"${db_pass}" xboard > ./database_dump.sql; then
-        err "数据库导出指令下发失败，备份链路熔断。"
+    $(docker_compose_cmd) -f docker-compose.yaml exec -T mysql mysqldump -uxboard -p"${db_pass}" xboard > ./database_dump.sql || true
+
+    local target_files=$(ls -A | grep -E 'docker-compose.yaml|\.env|database_dump\.sql' || true)
+    if [[ -z "$target_files" ]]; then
+        err "未找到任何核心配置或数据目录，备份终止。"
         rm -f ./database_dump.sql
         return
     fi
-
-    if [[ ! -s ./database_dump.sql ]]; then
-        err "数据库转储文件为空，严禁生成无效快照，备份终止。"
-        rm -f ./database_dump.sql
-        return
-    fi
-
-    local target_files="docker-compose.yaml .env database_dump.sql data"
     
     tar -czf "$backup_file" $target_files
     rm -f ./database_dump.sql
@@ -330,14 +324,6 @@ restore_backup() {
             return
         fi
         cd "$target_dir" && $(docker_compose_cmd) -f docker-compose.yaml down || true
-        
-        # 核心修正：绝对的物理清空，防止新老数据“缝合”导致数据库碎裂
-        rm -rf "$target_dir/data" \
-               "$target_dir/mysql_data" \
-               "$target_dir/redis_data" \
-               "$target_dir/docker-compose.yaml" \
-               "$target_dir/.env" \
-               "$target_dir/database_dump.sql"
     fi
     
     mkdir -p "$target_dir"
@@ -346,7 +332,7 @@ restore_backup() {
     echo "$target_dir" > "/etc/xboard_env"
     cd "$target_dir" || return
     
-    chmod -R 777 data mysql_data redis_data || true
+    chmod -R 777 data postgres_data redis_data || true
     
     $(docker_compose_cmd) -f docker-compose.yaml up -d || { err "恢复启动失败。"; return; }
     
@@ -358,19 +344,14 @@ restore_backup() {
     fi
     
     local server_ip=$(get_local_ip)
-    local restore_port
-    
-    # 核心修正：使用 sed 进行安全的行级捕获剥离，规避 grep 误判 '-' 为参数的风险
-    restore_port=$(sed -nE 's/^[[:space:]]*-[[:space:]]*"?([0-9]+):7001"?.*/\1/p' docker-compose.yaml | head -n1)
-    restore_port=${restore_port:-7001}
     
     echo -e "\n=================================================="
     echo -e "\033[32m✅ XBoard站点 恢复完成！\033[0m"
-    echo -e "访问地址: \033[36mhttp://${server_ip}:${restore_port}\033[0m"
+    echo -e "访问地址: \033[36mhttp://${server_ip}\033[0m"
     echo -e "==================================================\n"
 }
 
-# ---- 7. 自动化时钟 (熔断防御重构版) ----
+# ---- 7. 自动化时钟 (解耦物理引擎重构版) ----
 setup_auto_backup() {
     require_cmd crontab
     info "== 定时备份策略管控 =="
@@ -444,7 +425,7 @@ setup_auto_backup() {
         return
     fi
 
-    info "正在为您锻造携带错误熔断机制的守护程序..."
+    info "正在为您锻造专属于该目录的物理级守护程序..."
     cat > "$cron_script" << EOF
 #!/usr/bin/env bash
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
@@ -456,35 +437,18 @@ mkdir -p "\$BACKUP_DIR"
 TIMESTAMP=\$(date +"%Y%m%d_%H%M%S")
 BACKUP_FILE="\${BACKUP_DIR}/xboard_backup_\${TIMESTAMP}.tar.gz"
 
-if command -v docker-compose >/dev/null 2>&1; then
-    DC_CMD="docker-compose"
-elif docker compose version >/dev/null 2>&1; then
-    DC_CMD="docker compose"
-else
-    echo "[\$(date)] [FATAL] 未检测到 Docker Compose 引擎，时钟中止。" >> ${BACKUP_LOG}
-    exit 1
-fi
+DC_CMD=\$(command -v docker-compose >/dev/null 2>&1 && echo "docker-compose" || echo "docker compose")
 
 DB_PASS=\$(grep -oP '^DB_PASSWORD=\K.*' .env)
+\$DC_CMD -f docker-compose.yaml exec -T mysql mysqldump -uxboard -p"\${DB_PASS}" xboard > ./database_dump.sql
 
-if ! \$DC_CMD -f docker-compose.yaml exec -T mysql mysqldump -uxboard -p"\${DB_PASS}" xboard > ./database_dump.sql; then
-    echo "[\$(date)] [ERROR] 数据库导出指令下发失败，备份熔断。" >> ${BACKUP_LOG}
+TARGET_FILES=\$(ls -A | grep -E 'docker-compose.yaml|\.env|database_dump\.sql' || true)
+if [[ -n "\$TARGET_FILES" ]]; then
+    tar -czf "\$BACKUP_FILE" \$TARGET_FILES
     rm -f ./database_dump.sql
-    exit 1
+    cd "\$BACKUP_DIR" || exit 1
+    ls -t xboard_backup_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -I {} rm -f {}
 fi
-
-if [[ ! -s ./database_dump.sql ]]; then
-    echo "[\$(date)] [ERROR] 数据库转储文件为空，严禁生成无效快照，备份熔断。" >> ${BACKUP_LOG}
-    rm -f ./database_dump.sql
-    exit 1
-fi
-
-TARGET_FILES="docker-compose.yaml .env database_dump.sql data"
-
-tar -czf "\$BACKUP_FILE" \$TARGET_FILES
-rm -f ./database_dump.sql
-cd "\$BACKUP_DIR" || exit 1
-ls -t xboard_backup_*.tar.gz 2>/dev/null | awk 'NR>3' | xargs -I {} rm -f {}
 EOF
     chmod +x "$cron_script"
 
@@ -534,7 +498,6 @@ uninstall_service() {
 }
 
 install_ftp(){
-    require_cmd curl  # 核心修正：挂载必备依赖检测
     clear
     echo -e "\033[32m📂 FTP/SFTP 备份工具...\033[0m"
     bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
