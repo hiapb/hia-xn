@@ -40,7 +40,8 @@ docker_compose_cmd() {
 
 get_workdir() {
     if [[ -f "/etc/xboard_env" ]]; then
-        local dir=$(cat "/etc/xboard_env")
+        local dir
+        dir=$(cat "/etc/xboard_env")
         if [[ -d "$dir" ]]; then
             echo "$dir"
             return
@@ -56,7 +57,7 @@ wait_mysql_ready() {
 
     info "正在等待 MySQL 完全就绪..."
     for i in {1..60}; do
-        if $dc_cmd -f docker-compose.yaml exec -T mysql mysqladmin ping -h localhost -uroot -p"${db_pass}" >/dev/null 2>&1; then
+        if $dc_cmd -f docker-compose.yaml exec -T mysql mysqladmin ping -h localhost -uxboard -p"${db_pass}" >/dev/null 2>&1; then
             info "MySQL 已就绪。"
             return 0
         fi
@@ -73,6 +74,13 @@ get_compose_port() {
     echo "${port:-7001}"
 }
 
+fix_xboard_image() {
+    if [[ -f docker-compose.yaml ]]; then
+        sed -i 's#ghcr.io/ghcr.io/cedar2025/xboard:latest#ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
+        sed -i 's#image:[[:space:]]*cedar2025/xboard:latest#image: ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
+    fi
+}
+
 # ---- 1. 一键部署系统 ----
 deploy_xboard() {
     info "== 启动 XBoard 自动化部署编排 =="
@@ -80,7 +88,8 @@ deploy_xboard() {
     require_cmd curl
     require_cmd openssl
     
-    local dc_cmd=$(docker_compose_cmd)
+    local dc_cmd
+    dc_cmd=$(docker_compose_cmd)
 
     read -r -p "请输入安装路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local install_path=${input_path:-$DEFAULT_INSTALL_PATH}
@@ -98,8 +107,10 @@ deploy_xboard() {
     local host_port=${input_port:-7001}
 
     info "正在生成核心配置..."
-    local db_password=$(openssl rand -hex 16)
-    local app_key="base64:$(openssl rand -base64 32)"
+    local db_password
+    local app_key
+    db_password=$(openssl rand -hex 16)
+    app_key="base64:$(openssl rand -base64 32)"
     
     cat > .env <<EOF
 APP_NAME=XBoard
@@ -126,7 +137,6 @@ EOF
 
     info "正在拉取核心拓扑文件..."
     cat > docker-compose.yaml <<EOF
-version: '3.8'
 services:
   app:
     image: ghcr.io/cedar2025/xboard:latest
@@ -209,7 +219,7 @@ services:
     volumes:
       - ./mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${db_password}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "xboard", "-p${db_password}"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -218,14 +228,15 @@ EOF
     mkdir -p data mysql_data redis_data
     chmod -R 777 data mysql_data redis_data
 
-    info "正在拉起微服务矩阵 (首次拉取需 1-3 分钟)..."
+    info "正在拉起微服务矩阵..."
     $dc_cmd -f docker-compose.yaml up -d || { err "容器启动失败，请检查 Docker 状态。"; return; }
 
     wait_mysql_ready "$db_password" || return
 
     $dc_cmd -f docker-compose.yaml exec -T app php artisan xboard:install || warn "首次安装脚本执行异常，请手动检查。"
 
-    local server_ip=$(get_local_ip)
+    local server_ip
+    server_ip=$(get_local_ip)
 
     echo -e "\n=================================================="
     echo -e "\033[32m部署指令已下发！网关正在启动。\033[0m"
@@ -237,12 +248,16 @@ EOF
 
 # ---- 2. 升级服务 ----
 upgrade_service() {
-    local workdir=$(get_workdir)
+    local workdir
+    workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
         err "未检测到运行中的网关，请先执行 [1] 一键部署。"
         return
     fi
+
     cd "$workdir" || return
+    fix_xboard_image
+
     info "正在拉取最新镜像并重建容器..."
     $(docker_compose_cmd) -f docker-compose.yaml pull
     $(docker_compose_cmd) -f docker-compose.yaml up -d
@@ -253,7 +268,8 @@ upgrade_service() {
 
 # ---- 3/4. 启停控制 ----
 pause_service() {
-    local workdir=$(get_workdir)
+    local workdir
+    workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
         err "未检测到运行中的网关，请先执行 [1] 一键部署。"
         return
@@ -264,19 +280,22 @@ pause_service() {
 }
 
 restart_service() {
-    local workdir=$(get_workdir)
+    local workdir
+    workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
         err "未检测到运行中的网关，请先执行 [1] 一键部署。"
         return
     fi
     cd "$workdir" || return
+    fix_xboard_image
     $(docker_compose_cmd) -f docker-compose.yaml restart || true
     info "服务已重启。"
 }
 
-# ---- 5. 手动热备 ----
+# ---- 5. 手动备份 ----
 do_backup() {
-    local workdir=$(get_workdir)
+    local workdir
+    workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
         err "未检测到部署环境，无法执行备份。"
         return
@@ -284,13 +303,18 @@ do_backup() {
     
     local backup_dir="${workdir}/backups"
     mkdir -p "$backup_dir"
-    local timestamp=$(date +"%Y%m%d_%H%M%S")
-    local backup_file="${backup_dir}/xboard_backup_${timestamp}.tar.gz"
+
+    local timestamp
+    local backup_file
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    backup_file="${backup_dir}/xboard_backup_${timestamp}.tar.gz"
     
     info "开始执行备份..."
     cd "$workdir" || return
+    fix_xboard_image
     
-    local db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
+    local db_pass
+    db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
     
     if ! $(docker_compose_cmd) -f docker-compose.yaml exec -T mysql mysqldump -uxboard -p"${db_pass}" xboard > ./database_dump.sql; then
         err "数据库导出失败，备份终止。"
@@ -320,18 +344,22 @@ do_backup() {
     info "备份执行完毕。当前可用备份如下："
     for f in $(ls -t xboard_backup_*.tar.gz 2>/dev/null); do
         local abs_path="${backup_dir}/${f}"
-        local fsize=$(du -h "$f" | cut -f1)
+        local fsize
+        fsize=$(du -h "$f" | cut -f1)
         echo -e "  📦 \033[36m${abs_path}\033[0m (大小: ${fsize})"
     done
 }
 
-# ---- 6. 跨机恢复 ----
+# ---- 6. 恢复备份 ----
 restore_backup() {
     info "== 灾备恢复 / 数据迁入引擎 =="
     
     local default_backup=""
-    local current_wd=$(get_workdir)
-    local search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
+    local current_wd
+    local search_dir
+
+    current_wd=$(get_workdir)
+    search_dir="${current_wd:-$DEFAULT_INSTALL_PATH}/backups"
     
     if [[ -d "$search_dir" ]]; then
         default_backup=$(ls -t "${search_dir}"/xboard_backup_*.tar.gz 2>/dev/null | head -n 1 || true)
@@ -391,22 +419,17 @@ restore_backup() {
         mv postgres_data mysql_data
     fi
 
-    if grep -q 'cedar2025/xboard:latest' docker-compose.yaml; then
-        sed -i 's#cedar2025/xboard:latest#ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
-    fi
+    fix_xboard_image
     
     $(docker_compose_cmd) -f docker-compose.yaml up -d || { err "恢复启动失败。"; return; }
     
-    local db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
+    local db_pass
+    db_pass=$(grep -oP '^DB_PASSWORD=\K.*' .env)
+
     wait_mysql_ready "$db_pass" || return
 
     if [[ -f "./database_dump.sql" ]]; then
-        info "正在清空旧数据库并导入备份 SQL..."
-
-        $(docker_compose_cmd) -f docker-compose.yaml exec -T mysql mysql -uroot -p"${db_pass}" -e "DROP DATABASE IF EXISTS xboard; CREATE DATABASE xboard CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; GRANT ALL PRIVILEGES ON xboard.* TO 'xboard'@'%'; FLUSH PRIVILEGES;" || {
-            err "重建数据库失败，恢复终止。"
-            return
-        }
+        info "正在导入备份 SQL..."
 
         if ! $(docker_compose_cmd) -f docker-compose.yaml exec -T mysql mysql -uxboard -p"${db_pass}" xboard < ./database_dump.sql; then
             err "数据库导入失败，请检查 database_dump.sql。"
@@ -419,8 +442,9 @@ restore_backup() {
         warn "备份包中没有 database_dump.sql，仅恢复了文件和容器配置。"
     fi
     
-    local server_ip=$(get_local_ip)
+    local server_ip
     local restore_port
+    server_ip=$(get_local_ip)
     restore_port=$(get_compose_port)
     
     echo -e "\n=================================================="
@@ -429,12 +453,13 @@ restore_backup() {
     echo -e "==================================================\n"
 }
 
-# ---- 7. 自动化时钟 ----
+# ---- 7. 定时备份 ----
 setup_auto_backup() {
     require_cmd crontab
     info "== 定时备份策略管控 =="
 
-    local workdir=$(get_workdir)
+    local workdir
+    workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
         err "未检测到部署环境，无法配置定时备份。"
         return
@@ -503,7 +528,7 @@ setup_auto_backup() {
         return
     fi
 
-    info "正在为您锻造专属于该目录的物理级守护程序..."
+    info "正在为您生成定时备份程序..."
     cat > "$cron_script" << EOF
 #!/usr/bin/env bash
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH"
@@ -523,6 +548,9 @@ else
     echo "[\$(date)] [FATAL] 未检测到 Docker Compose 引擎，时钟中止。" >> ${BACKUP_LOG}
     exit 1
 fi
+
+sed -i 's#ghcr.io/ghcr.io/cedar2025/xboard:latest#ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
+sed -i 's#image:[[:space:]]*cedar2025/xboard:latest#image: ghcr.io/cedar2025/xboard:latest#g' docker-compose.yaml
 
 DB_PASS=\$(grep -oP '^DB_PASSWORD=\K.*' .env)
 
@@ -570,7 +598,8 @@ EOF
 
 # ---- 8. 彻底卸载 ----
 uninstall_service() {
-    local workdir=$(get_workdir)
+    local workdir
+    workdir=$(get_workdir)
     if [[ -z "$workdir" ]]; then
         err "未检测到部署环境，无需卸载。"
         return
@@ -590,7 +619,8 @@ uninstall_service() {
     rm -rf "$workdir" || true
     rm -f "/etc/xboard_env" || true
     
-    local tmp_cron=$(mktemp)
+    local tmp_cron
+    tmp_cron=$(mktemp)
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
     crontab "$tmp_cron" 2>/dev/null || true
     rm -f "$tmp_cron" || true
@@ -613,7 +643,8 @@ main_menu() {
     echo "==================================================="
     echo "                 XBoard 一键管理                 "
     echo "==================================================="
-    local wd=$(get_workdir)
+    local wd
+    wd=$(get_workdir)
     echo -e " 实例运行路径: \033[36m${wd:-未部署}\033[0m"
     echo "---------------------------------------------------"
     echo "  1) 一键部署"
